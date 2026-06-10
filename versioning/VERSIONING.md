@@ -226,7 +226,117 @@ Reported as notes, never as parameter edits:
 
 ---
 
-## 4. Adding a new version (e.g. 1.3)
+## 4. Plugin author's guide — connected inputs
+
+This section is the source of truth for renderer/DCC plugin authors (Arnold
+`mtoa`/`htoa`, etc.) who implement version upgrade/downgrade natively.
+
+A node's parameters are frequently **connected** to upstream node outputs, so
+their values are not known until render time. You therefore cannot always
+"compute the new value." The right mental model is:
+
+> **A version migration is a per-parameter *transform*. If the input carries a
+> literal value, you *fold* the transform to a new constant. If the input is
+> *connected*, you realize the same transform as a small node network inserted
+> between the upstream output and the shader input.**
+
+Folding and network-insertion are two realizations of the *same* math. The
+`convert_params` core does the fold; the math below is what you insert when the
+input is connected.
+
+### Operation kinds
+
+Every parameter migration is one of five operations. Only **TRANSFORM** ever
+requires a network:
+
+| Op | If the input is **valued** | If the input is **connected** |
+|----|----------------------------|-------------------------------|
+| **PASS** | leave as-is | leave as-is |
+| **SET_CONST** | write the constant | write the constant (no upstream involved) |
+| **TRANSFORM** | evaluate the expression numerically | **insert nodes computing the expression**, then rewire |
+| **DROP** | remove the input | disconnect, then remove the input |
+| **RENAME** | move the value to the new name | move the *connection* to the new name |
+
+### 1.1 ↔ 1.2 operation table
+
+`expr` is over the **source** inputs.
+
+| Parameter | 1.1 → 1.2 | 1.2 → 1.1 | Needs a network when connected? |
+|-----------|-----------|-----------|---------------------------------|
+| `specular_weight`, and all unaffected params | PASS | PASS | never |
+| `emission_weight` | **SET_CONST = 1** | DROP | never (a new constant factor) |
+| `emission_luminance` | PASS | **TRANSFORM** `L = emission_weight · emission_luminance` | yes (down) |
+| `transmission_scatter` | **TRANSFORM** `Ω = S / (−ln T)`, clamp [0,1] | **TRANSFORM** `S = Ω · (−ln T)` | yes (both directions) |
+| `specular_haze`, `specular_haze_spread`, `specular_retroreflectivity` | — (inert defaults) | DROP (+ warn if non-default) | yes → just disconnect |
+
+`T` = `transmission_color`, `S`/`Ω` = `transmission_scatter`.
+
+### The two TRANSFORM networks (MaterialX stdlib nodes)
+
+Port these to your renderer's equivalent shading nodes. All of `ln`, `multiply`,
+`divide`, `subtract`, `clamp` exist in the MaterialX standard library.
+
+**`transmission_scatter`, 1.1 → 1.2** — `Ω = S / (−ln T)`:
+
+```
+ln_T   = <ln>       in  = transmission_color        # natural log, per channel
+negln  = <multiply> in1 = ln_T,  in2 = -1
+omega  = <divide>   in1 = transmission_scatter, in2 = negln
+omegaC = <clamp>    in  = omega, low = 0, high = 1
+         → wire omegaC into open_pbr_surface.transmission_scatter
+```
+
+⚠️ Guard `T → 1` (white channel): `−ln T → 0`, so `μ_t = 0` and the divide is
+singular. Force `Ω = 0` there (clamp the denominator away from 0, or branch).
+
+**`transmission_scatter`, 1.2 → 1.1** — `S = Ω · (−ln T)`:
+
+```
+ln_T  = <ln>       in  = transmission_color
+negln = <multiply> in1 = ln_T, in2 = -1
+S     = <multiply> in1 = transmission_scatter, in2 = negln
+        → wire S into open_pbr_surface.transmission_scatter   (no clamp; 1.1 has none)
+```
+
+**`emission_luminance`, 1.2 → 1.1** — `L = emission_weight · emission_luminance`:
+
+```
+L = <multiply> in1 = <emission_weight source>, in2 = <emission_luminance source>
+    → wire L into open_pbr_surface.emission_luminance ; remove the emission_weight input
+```
+
+Each `in*` is the constant if that input was valued, or the upstream output if
+it was connected — one `multiply` covers all valued/connected combinations.
+
+### Connected inputs degrade warnings to render-time clamps
+
+The Class-B safeguards that the value path reports as **author-time warnings**
+become **in-graph clamps** for a connected input, because the values are dynamic:
+
+* the `transmission_scatter` `clamp(0,1)` node silently absorbs the 1.1
+  grey-shift regime per texel — you cannot warn "this texture exceeds the
+  single-scattering range" up front; the clamp node *is* the closest match;
+* likewise the `T → 1` guard.
+
+So the rule to follow is: **fold when you can read a constant; otherwise insert
+the network — and accept that bounded-loss (Class B) warnings become in-graph
+clamps.** Class-C differences (§3.5) are unaffected either way: no network can
+address them.
+
+### Recipe
+
+```
+for each shader input:
+    look up its operation in the table above
+    if the input is VALUED:     apply the value-path result from convert_params()
+    if the input is CONNECTED:  PASS/DROP/SET_CONST directly, or for TRANSFORM
+                                insert the network above and rewire
+surface any Class-B warnings and Class-C notes to the user
+```
+
+---
+
+## 5. Adding a new version (e.g. 1.3)
 
 When 1.3 ships, complete this checklist — **no other code needs to change**;
 multi-hop conversions (1.1 ↔ 1.3) compose automatically.
@@ -266,11 +376,13 @@ multi-hop conversions (1.1 ↔ 1.3) compose automatically.
 
 7. **Test:** add per-map numeric tests, both round-trips
    (1.2 → 1.3 → 1.2 and the reverse), and edge/clamp cases. Document this
-   mapping in §3.
+   mapping in §3, and — if any map is a **TRANSFORM** (a value that depends on
+   another parameter) — add its operation row and node network to §4 so plugin
+   authors know how to handle the connected case.
 
 ---
 
-## 5. API usage
+## 6. API usage
 
 ### Core (dependency-free)
 
@@ -314,7 +426,7 @@ auto-detect).
 
 ---
 
-## 6. Command-line usage
+## 7. Command-line usage
 
 ```bash
 # Upgrade a material 1.1 -> 1.2 (writes glass_v1.2.mtlx)
@@ -329,7 +441,7 @@ notes, and the output path. Exit code is non-zero on error.
 
 ---
 
-## 7. Tests
+## 8. Tests
 
 `test_openpbr_version.py` validates the closed-form maps, both round-trips, the
 bounded-loss edge cases, and the chaining architecture (via a synthetic 1.3
