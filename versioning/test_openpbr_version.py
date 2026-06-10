@@ -269,6 +269,89 @@ def test_input_not_mutated():
 
 
 # ---------------------------------------------------------------------------
+# MaterialX wrapper: connected (node-driven) inputs
+# (skipped automatically if the MaterialX package is not installed)
+# ---------------------------------------------------------------------------
+
+def _materialx_available():
+    try:
+        import MaterialX  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _openpbr_doc(emission_luminance_input):
+    """A minimal OpenPBR doc whose emission_luminance is the given XML snippet."""
+    return f"""<?xml version="1.0"?>
+<materialx version="1.39">
+  <constant name="lum_tex" type="float">
+    <input name="value" type="float" value="800"/>
+  </constant>
+  <open_pbr_surface name="M" type="surfaceshader">
+    {emission_luminance_input}
+    <input name="emission_color" type="color3" value="1, 0.6, 0.2"/>
+  </open_pbr_surface>
+  <surfacematerial name="M_mat" type="material">
+    <input name="surfaceshader" type="surfaceshader" nodename="M"/>
+  </surfacematerial>
+</materialx>"""
+
+
+def test_wrapper_connected_emission_luminance_gets_weight():
+    if not _materialx_available():
+        return  # skip
+    from openpbr_version import convert
+    xml = _openpbr_doc('<input name="emission_luminance" type="float" nodename="lum_tex"/>')
+    r = convert(input_string=xml, from_version="1.1", to_version="1.2")
+    assert r.success
+    assert 'name="emission_weight"' in r.output_xml      # authored as a constant
+    assert 'value="1"' in r.output_xml
+    assert 'nodename="lum_tex"' in r.output_xml          # connection preserved
+    assert any("node-connected" in w for w in r.warnings)
+
+
+def test_wrapper_valued_emission_luminance_gets_weight_via_core():
+    if not _materialx_available():
+        return  # skip
+    from openpbr_version import convert
+    xml = _openpbr_doc('<input name="emission_luminance" type="float" value="800"/>')
+    r = convert(input_string=xml, from_version="1.1", to_version="1.2")
+    assert r.success
+    assert 'name="emission_weight"' in r.output_xml
+    # The valued path is handled by the core, not the connection fixup:
+    assert not any("node-connected" in w for w in r.warnings)
+
+
+def test_wrapper_no_emission_no_weight_added():
+    if not _materialx_available():
+        return  # skip
+    from openpbr_version import convert
+    xml = """<?xml version="1.0"?>
+<materialx version="1.39">
+  <open_pbr_surface name="M" type="surfaceshader">
+    <input name="base_color" type="color3" value="0.2, 0.4, 0.6"/>
+  </open_pbr_surface>
+  <surfacematerial name="M_mat" type="material">
+    <input name="surfaceshader" type="surfaceshader" nodename="M"/>
+  </surfacematerial>
+</materialx>"""
+    r = convert(input_string=xml, from_version="1.1", to_version="1.2")
+    assert r.success
+    assert "emission_weight" not in r.output_xml         # no emission -> no weight
+
+
+def test_wrapper_connected_weight_not_added_when_downgrading():
+    if not _materialx_available():
+        return  # skip
+    from openpbr_version import convert
+    xml = _openpbr_doc('<input name="emission_luminance" type="float" nodename="lum_tex"/>')
+    r = convert(input_string=xml, from_version="1.2", to_version="1.1")
+    assert r.success
+    assert "emission_weight" not in r.output_xml         # weight doesn't exist in 1.1
+
+
+# ---------------------------------------------------------------------------
 # Chaining architecture: composing adjacent migrations (e.g. 1.1 -> 1.3)
 # ---------------------------------------------------------------------------
 

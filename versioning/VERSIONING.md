@@ -100,6 +100,33 @@ apply correctly.
   It reads the `open_pbr_surface` shader instance, runs the core, and writes the
   converted parameters back, touching only the inputs the conversion changed.
 
+### Valued vs. connected inputs
+
+Whether a parameter is a literal **value** or **connected** to another node is
+never something the caller specifies — the two layers handle it differently:
+
+* The **core** has no concept of connections. It sees only values, so a
+  connected (texture-driven) parameter is simply *absent from the dict*.
+  Connection handling is the integrating application's concern.
+* The **wrapper** reads connectivity *from the document*: a MaterialX `<input>`
+  is "valued" if it has a `value=` attribute and "connected" if it instead has
+  `nodename=` / `nodegraph=` / `output=` / `interfacename=` (then
+  `getValueString()` is empty). Connected inputs are passed through untouched.
+
+Most maps need no special handling for connected inputs, but the **coupled**
+maps (whose result depends on *another* parameter) do:
+
+* **`emission_weight` (1.1 → 1.2)** must be authored as the constant `1` even
+  when `emission_luminance` is connected, or the textured emission goes dark
+  (the new weight defaults to 0). `weight = 1` is exact regardless of how
+  luminance is driven, so the wrapper detects a connected `emission_luminance`
+  and sets it (with a warning). The valued case is handled by the core.
+* **`transmission_scatter` (the `Ω = −S/ln T` albedo remap)** depends on
+  `transmission_color`. If either input is node-driven, the result cannot be
+  reduced to a constant; reproducing it exactly requires inserting the
+  computation as nodes, which the wrapper does **not** do. Such cases are left
+  to the application (insert a sub-graph, or approximate and flag).
+
 ---
 
 ## 3. The 1.1 ↔ 1.2 mapping reference

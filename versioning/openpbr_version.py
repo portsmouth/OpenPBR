@@ -524,6 +524,56 @@ def _format_mtlx_value(value, mtype):
     return f"{_as_float(value):g}"
 
 
+def _input_is_connected(inp):
+    """True if a MaterialX input draws from a node/graph rather than a literal.
+
+    Connectivity is read from the document — the caller never specifies it.  An
+    input is "valued" when it has a ``value`` attribute and "connected" when it
+    instead references a ``nodename`` / ``nodegraph`` / ``output`` /
+    ``interfacename``; in the latter case ``getValueString()`` is empty.
+    """
+    return bool(inp.getNodeName() or inp.getNodeGraphString()
+                or inp.getInterfaceName() or inp.getOutputString())
+
+
+def _emission_weight_introduced(from_version, to_version):
+    """True if the conversion is an upgrade that first introduces emission_weight."""
+    fi, ti = VERSION_ORDER.index(from_version), VERSION_ORDER.index(to_version)
+    return (ti > fi
+            and "emission_weight" in DEFAULTS.get(to_version, {})
+            and "emission_weight" not in DEFAULTS.get(from_version, {}))
+
+
+def _fixup_connected_inputs(shader, from_version, to_version, warnings):
+    """Document-level fixups for *connected* inputs the value-only core can't see.
+
+    The core (``convert_params``) only sees literal values, so a node-connected
+    input is invisible to it.  Most connected inputs need no action (they pass
+    through untouched), but the emission reparametrization is an exception:
+
+    Upgrading across the boundary that introduces ``emission_weight`` (1.1 ->
+    1.2), a node-connected ``emission_luminance`` must still get
+    ``emission_weight = 1``.  The new weight defaults to 0, so a textured
+    emission would otherwise go dark.  ``weight = 1`` is a constant and exact
+    regardless of how luminance is driven, since 1.2 emission is
+    ``emission_weight * emission_color * emission_luminance``.  (The valued case
+    is already handled by the core.)
+
+    Other connection-sensitive maps (e.g. the ``transmission_scatter`` albedo
+    remap when ``transmission_color`` is textured) cannot be reduced to a
+    constant and are left to the integrating application; see VERSIONING.md.
+    """
+    if _emission_weight_introduced(from_version, to_version):
+        lum = shader.getInput("emission_luminance")
+        if (lum is not None and _input_is_connected(lum)
+                and shader.getInput("emission_weight") is None):
+            shader.addInput("emission_weight", "float").setValueString("1")
+            warnings.append(
+                "emission_luminance is node-connected: authored emission_weight "
+                "= 1 so the textured emission is preserved (it would otherwise "
+                "default to 0 in the target version).")
+
+
 def convert(*, input_path=None, input_string=None, from_version, to_version,
             output_path=None):
     """Convert an OpenPBR Surface MaterialX document between versions.
@@ -602,6 +652,9 @@ def convert(*, input_path=None, input_string=None, from_version, to_version,
             shader.getInput(name).getType() if shader.getInput(name) else "float")
         inp = shader.getInput(name) or shader.addInput(name, mtype)
         inp.setValueString(_format_mtlx_value(value, mtype))
+
+    # Handle connected inputs the value-only core could not see.
+    _fixup_connected_inputs(shader, from_version, to_version, result.warnings)
 
     try:
         result.output_xml = mx.writeToXmlString(doc, _mx_write_options(mx))
